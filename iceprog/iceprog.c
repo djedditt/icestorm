@@ -155,6 +155,13 @@ static void sram_chip_select()
 	set_cs_creset(0, 1);
 }
 
+// SRAM chip select deassert is the same as flash_release_reset()
+// For ease of code reading we use this function instead
+static void sram_chip_deselect()
+{
+	set_cs_creset(1, 1);
+}
+
 static void flash_read_id()
 {
 	/* JEDEC ID structure:
@@ -446,6 +453,73 @@ static void flash_disable_protection()
 
 }
 
+static uint8_t nvcm_read_status()
+{
+	uint8_t data[2] = { FC_RSR1 };
+
+	mpsse_send_dummy_bytes(125);
+	sram_chip_select();
+	mpsse_xfer_spi(data, sizeof(data));
+	sram_chip_deselect();
+	mpsse_send_dummy_bytes(126);
+
+	return data[1];
+}
+
+static bool nvcm_mode_entry()
+{
+	uint8_t nvcm_entry_sequence[] = { 0x7e, 0xaa, 0x99, 0x7e, 0x01, 0x0e };
+
+	fprintf(stderr, "reset..\n");
+
+	sram_reset();
+	usleep(100);
+
+	sram_chip_select();
+	usleep(2000);
+
+	fprintf(stderr, "cdone: %s\n", get_cdone() ? "high" : "low");
+
+	mpsse_send_spi(nvcm_entry_sequence, sizeof(nvcm_entry_sequence));
+	sram_chip_deselect();
+
+	int retries = 32;
+	while (retries--) {
+		if (0 == (nvcm_read_status() & 0xC1)) return true;
+	}
+
+	return false;
+}
+
+static bool nvcm_select_bank(int bank)
+{
+	uint8_t bank_select_command[] = { 0x83, 0x00, 0x00, 0x25, 0x00 };
+
+	if ( (bank < 0) || (bank > 2) ) return false;
+
+	bank_select_command[4] |= bank << 4;
+
+	sram_chip_select();
+	mpsse_send_spi(bank_select_command, sizeof(bank_select_command));
+	sram_chip_deselect();
+
+	return (0 == (nvcm_read_status() & 0xC1));
+}
+
+static void nvcm_read_bank(int bank, int addr, uint8_t *data, int n)
+{
+	if (!nvcm_select_bank(bank)) return;
+
+	uint8_t read_command[4] = { FC_RD, (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr };
+
+	sram_chip_select();
+	mpsse_send_spi(read_command, sizeof(read_command));
+	mpsse_send_dummy_bytes(9 /* read latency */);
+	memset(data, 0, n);
+	mpsse_xfer_spi(data, n);
+	sram_chip_deselect();
+}
+
 // ---------------------------------------------------------
 // iceprog implementation
 // ---------------------------------------------------------
@@ -457,6 +531,7 @@ static void help(const char *progname)
 	fprintf(stderr, "       %s -r|-R<bytes> <output file>\n", progname);
 	fprintf(stderr, "       %s -S <input file>\n", progname);
 	fprintf(stderr, "       %s -t\n", progname);
+	fprintf(stderr, "       %s -T\n", progname);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "General options:\n");
 	fprintf(stderr, "  -d <device string>    use the specified USB device [default: i:0x0403:0x6010 or i:0x0403:0x6014]\n");
@@ -484,6 +559,7 @@ static void help(const char *progname)
 	fprintf(stderr, "  -c                    do not write flash, only verify (`check')\n");
 	fprintf(stderr, "  -S                    perform SRAM programming\n");
 	fprintf(stderr, "  -t                    just read the flash ID sequence\n");
+	fprintf(stderr, "  -T                    just read the NVCM ID\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Erase mode (only meaningful in default mode):\n");
 	fprintf(stderr, "  [default]             erase aligned chunks of 64kB in write mode\n");
@@ -544,6 +620,7 @@ int main(int argc, char **argv)
 	bool dont_erase = false;
 	bool prog_sram = false;
 	bool test_mode = false;
+	bool nvcm_id = false;
 	bool slow_clock = false;
 	bool disable_protect = false;
 	bool disable_verify = false;
@@ -565,7 +642,7 @@ int main(int argc, char **argv)
 	/* Decode command line parameters */
 	int opt;
 	char *endptr;
-	while ((opt = getopt_long(argc, argv, "d:i:I:rR:e:o:cbnStvspXk", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:i:I:rR:e:o:cbnStvspXkT", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd': /* device string */
 			devstr = optarg;
@@ -655,6 +732,9 @@ int main(int argc, char **argv)
 		case 't': /* just read flash id */
 			test_mode = true;
 			break;
+		case 'T': /* just read NVCM id */
+			nvcm_id = true;
+			break;
 		case 'v': /* provide verbose output */
 			verbose = true;
 			break;
@@ -682,8 +762,8 @@ int main(int argc, char **argv)
 
 	/* Make sure that the combination of provided parameters makes sense */
 
-	if (read_mode + erase_mode + check_mode + prog_sram + test_mode > 1) {
-		fprintf(stderr, "%s: options `-r'/`-R', `-e`, `-c', `-S', and `-t' are mutually exclusive\n", my_name);
+	if (read_mode + erase_mode + check_mode + prog_sram + test_mode + nvcm_id > 1) {
+		fprintf(stderr, "%s: options `-r'/`-R', `-e`, `-c', `-S', `-t', and `-T' are mutually exclusive\n", my_name);
 		return EXIT_FAILURE;
 	}
 
@@ -692,17 +772,17 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (disable_protect && (read_mode || check_mode || prog_sram || test_mode)) {
+	if (disable_protect && (read_mode || check_mode || prog_sram || test_mode || nvcm_id)) {
 		fprintf(stderr, "%s: option `-p' only valid in programming mode\n", my_name);
 		return EXIT_FAILURE;
 	}
 
-	if (bulk_erase && (read_mode || check_mode || prog_sram || test_mode)) {
+	if (bulk_erase && (read_mode || check_mode || prog_sram || test_mode || nvcm_id)) {
 		fprintf(stderr, "%s: option `-b' only valid in programming mode\n", my_name);
 		return EXIT_FAILURE;
 	}
 
-	if (dont_erase && (read_mode || check_mode || prog_sram || test_mode)) {
+	if (dont_erase && (read_mode || check_mode || prog_sram || test_mode || nvcm_id)) {
 		fprintf(stderr, "%s: option `-n' only valid in programming mode\n", my_name);
 		return EXIT_FAILURE;
 	}
@@ -730,7 +810,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	} else if (bulk_erase || disable_protect) {
 		filename = "/dev/null";
-	} else if (!test_mode && !erase_mode && !disable_protect) {
+	} else if (!test_mode && !erase_mode && !disable_protect && !nvcm_id) {
 		fprintf(stderr, "%s: missing argument\n", my_name);
 		fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
 		return EXIT_FAILURE;
@@ -742,7 +822,7 @@ int main(int argc, char **argv)
 	FILE *f = NULL;
 	long file_size = -1;
 
-	if (test_mode) {
+	if (test_mode || nvcm_id) {
 		/* nop */;
 	} else if (erase_mode) {
 		file_size = erase_size;
@@ -848,6 +928,49 @@ int main(int argc, char **argv)
 		usleep(250000);
 
 		fprintf(stderr, "cdone: %s\n", get_cdone() ? "high" : "low");
+	}
+	else if (nvcm_id)
+	{
+		if (!nvcm_mode_entry()) {
+			fprintf(stderr, "unable to enter NVCM mode! is NVCM present?\n");
+			mpsse_error(3);
+		} else {
+			uint8_t id = 0;
+			nvcm_read_bank(2, 0, &id, 1); /* Device ID is stored in a single byte at address 0 in NVCM bank 2 */
+
+			struct {
+				uint8_t id;
+				const char *name;
+			} nvcm_id_table[] = {
+				{ .id = 0x06, .name = "ICE40LP8K / ICE40HX8K" },
+				{ .id = 0x07, .name = "ICE40LP4K / ICE40HX4K" },
+				{ .id = 0x08, .name = "ICE40LP1K / ICE40HX1K" },
+				{ .id = 0x09, .name = "ICE40LP384" },
+				{ .id = 0x0E, .name = "ICE40LP1K_SWG16" },
+				{ .id = 0x0F, .name = "ICE40LP640_SWG16" },
+				{ .id = 0x10, .name = "ICE5LP1K" },
+				{ .id = 0x11, .name = "ICE5LP2K" },
+				{ .id = 0x12, .name = "ICE5LP4K" },
+				{ .id = 0x14, .name = "ICE40UL1K" },
+				{ .id = 0x15, .name = "ICE40UL640" },
+				{ .id = 0x20, .name = "ICE40UP5K" },
+				{ .id = 0x21, .name = "ICE40UP3K" },
+			};
+
+			const char *name = NULL;
+			for (int i = 0; i < (sizeof(nvcm_id_table) / sizeof(*nvcm_id_table)); i++) {
+				if (nvcm_id_table[i].id == id) {
+					name = nvcm_id_table[i].name;
+					break;
+				}
+			}
+
+			fprintf(stderr, "NVCM Device ID: ");
+			if (name)
+				fprintf(stderr, "%s\n", name);
+			else
+				fprintf(stderr, "unknown (0x%02x)\n", id);
+		}
 	}
 	else if (prog_sram)
 	{
